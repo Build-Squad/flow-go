@@ -1,10 +1,8 @@
 package state_stream
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"math/rand"
 	"testing"
 	"time"
 
@@ -18,15 +16,12 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/onflow/flow-go/engine"
-	"github.com/onflow/flow-go/ledger"
-	"github.com/onflow/flow-go/ledger/common/testutils"
 	"github.com/onflow/flow-go/model/flow"
 	"github.com/onflow/flow-go/module/blobs"
 	"github.com/onflow/flow-go/module/executiondatasync/execution_data"
-	herocache "github.com/onflow/flow-go/module/mempool/herocache/backdata"
-	"github.com/onflow/flow-go/module/mempool/herocache/backdata/heropool"
+	"github.com/onflow/flow-go/module/executiondatasync/execution_data/cache"
+	"github.com/onflow/flow-go/module/mempool/herocache"
 	"github.com/onflow/flow-go/module/metrics"
-	"github.com/onflow/flow-go/module/state_synchronization/requester"
 	protocolmock "github.com/onflow/flow-go/state/protocol/mock"
 	"github.com/onflow/flow-go/storage"
 	storagemock "github.com/onflow/flow-go/storage/mock"
@@ -43,17 +38,18 @@ type BackendExecutionDataSuite struct {
 	suite.Suite
 
 	state    *protocolmock.State
+	params   *protocolmock.Params
 	snapshot *protocolmock.Snapshot
 	headers  *storagemock.Headers
 	seals    *storagemock.Seals
 	results  *storagemock.ExecutionResults
 
-	bs                  blobs.Blobstore
-	eds                 execution_data.ExecutionDataStore
-	broadcaster         *engine.Broadcaster
-	execDataDistributor *requester.ExecutionDataDistributor
-	execDataCache       *herocache.Cache
-	backend             *StateStreamBackend
+	bs                blobs.Blobstore
+	eds               execution_data.ExecutionDataStore
+	broadcaster       *engine.Broadcaster
+	execDataCache     *cache.ExecutionDataCache
+	execDataHeroCache *herocache.BlockExecutionData
+	backend           *StateStreamBackend
 
 	blocks      []*flow.Block
 	blockEvents map[flow.Identifier]flow.EventsList
@@ -68,12 +64,11 @@ func TestBackendExecutionDataSuite(t *testing.T) {
 }
 
 func (s *BackendExecutionDataSuite) SetupTest() {
-	rand.Seed(time.Now().UnixNano())
-
 	logger := unittest.Logger()
 
 	s.state = protocolmock.NewState(s.T())
 	s.snapshot = protocolmock.NewSnapshot(s.T())
+	s.params = protocolmock.NewParams(s.T())
 	s.headers = storagemock.NewHeaders(s.T())
 	s.seals = storagemock.NewSeals(s.T())
 	s.results = storagemock.NewExecutionResults(s.T())
@@ -82,15 +77,9 @@ func (s *BackendExecutionDataSuite) SetupTest() {
 	s.eds = execution_data.NewExecutionDataStore(s.bs, execution_data.DefaultSerializer)
 
 	s.broadcaster = engine.NewBroadcaster()
-	s.execDataDistributor = requester.NewExecutionDataDistributor()
 
-	s.execDataCache = herocache.NewCache(
-		DefaultCacheSize,
-		herocache.DefaultOversizeFactor,
-		heropool.LRUEjection,
-		logger,
-		metrics.NewNoopCollector(),
-	)
+	s.execDataHeroCache = herocache.NewBlockExecutionData(DefaultCacheSize, logger, metrics.NewNoopCollector())
+	s.execDataCache = cache.NewExecutionDataCache(s.eds, s.headers, s.seals, s.results, s.execDataHeroCache)
 
 	conf := Config{
 		ClientSendTimeout:    DefaultSendTimeout,
@@ -98,18 +87,6 @@ func (s *BackendExecutionDataSuite) SetupTest() {
 	}
 
 	var err error
-	s.backend, err = New(
-		logger,
-		conf,
-		s.state,
-		s.headers,
-		s.seals,
-		s.results,
-		s.eds,
-		s.execDataCache,
-		s.broadcaster,
-	)
-	require.NoError(s.T(), err)
 
 	blockCount := 5
 	s.execDataMap = make(map[flow.Identifier]*execution_data.BlockExecutionDataEntity, blockCount)
@@ -120,24 +97,41 @@ func (s *BackendExecutionDataSuite) SetupTest() {
 	s.blocks = make([]*flow.Block, 0, blockCount)
 
 	// generate blockCount consecutive blocks with associated seal, result and execution data
-	firstBlock := unittest.BlockFixture()
-	parent := firstBlock.Header
+	rootBlock := unittest.BlockFixture()
+	parent := rootBlock.Header
+	s.blockMap[rootBlock.Header.Height] = &rootBlock
+
+	s.T().Logf("Generating %d blocks, root block: %d %s", blockCount, rootBlock.Header.Height, rootBlock.ID())
+
 	for i := 0; i < blockCount; i++ {
-		var block *flow.Block
-		if i == 0 {
-			block = &firstBlock
-		} else {
-			block = unittest.BlockWithParentFixture(parent)
-		}
+		block := unittest.BlockWithParentFixture(parent)
 		// update for next iteration
 		parent = block.Header
 
 		seal := unittest.BlockSealsFixture(1)[0]
 		result := unittest.ExecutionResultFixture()
 		blockEvents := unittest.BlockEventsFixture(block.Header, (i%len(testEventTypes))*3+1, testEventTypes...)
-		execData := blockExecutionDataFixture(s.T(), block, blockEvents.Events)
 
-		result.ExecutionDataID, err = s.eds.AddExecutionData(context.TODO(), execData)
+		numChunks := 5
+		chunkDatas := make([]*execution_data.ChunkExecutionData, 0, numChunks)
+		for i := 0; i < numChunks; i++ {
+			var events flow.EventsList
+			switch {
+			case i >= len(blockEvents.Events):
+				events = flow.EventsList{}
+			case i == numChunks-1:
+				events = blockEvents.Events[i:]
+			default:
+				events = flow.EventsList{blockEvents.Events[i]}
+			}
+			chunkDatas = append(chunkDatas, unittest.ChunkExecutionDataFixture(s.T(), execution_data.DefaultMaxBlobSize/5, unittest.WithChunkEvents(events)))
+		}
+		execData := unittest.BlockExecutionDataFixture(
+			unittest.WithBlockExecutionDataBlockID(block.ID()),
+			unittest.WithChunkExecutionDatas(chunkDatas...),
+		)
+
+		result.ExecutionDataID, err = s.eds.Add(context.TODO(), execData)
 		assert.NoError(s.T(), err)
 
 		s.blocks = append(s.blocks, block)
@@ -151,7 +145,7 @@ func (s *BackendExecutionDataSuite) SetupTest() {
 	}
 
 	s.state.On("Sealed").Return(s.snapshot, nil).Maybe()
-	s.snapshot.On("Head").Return(firstBlock.Header, nil).Maybe()
+	s.snapshot.On("Head").Return(s.blocks[0].Header, nil).Maybe()
 
 	s.seals.On("FinalizedSealForBlock", mock.AnythingOfType("flow.Identifier")).Return(
 		func(blockID flow.Identifier) *flow.Seal {
@@ -216,6 +210,36 @@ func (s *BackendExecutionDataSuite) SetupTest() {
 			return storage.ErrNotFound
 		},
 	).Maybe()
+
+	s.headers.On("BlockIDByHeight", mock.AnythingOfType("uint64")).Return(
+		func(height uint64) flow.Identifier {
+			if block, ok := s.blockMap[height]; ok {
+				return block.Header.ID()
+			}
+			return flow.ZeroID
+		},
+		func(height uint64) error {
+			if _, ok := s.blockMap[height]; ok {
+				return nil
+			}
+			return storage.ErrNotFound
+		},
+	).Maybe()
+
+	s.backend, err = New(
+		logger,
+		conf,
+		s.state,
+		s.headers,
+		s.seals,
+		s.results,
+		s.eds,
+		s.execDataCache,
+		s.broadcaster,
+		rootBlock.Header.Height,
+		rootBlock.Header.Height, // initialize with no downloaded data
+	)
+	require.NoError(s.T(), err)
 }
 
 func (s *BackendExecutionDataSuite) TestGetExecutionDataByBlockID() {
@@ -227,9 +251,12 @@ func (s *BackendExecutionDataSuite) TestGetExecutionDataByBlockID() {
 	result := s.resultMap[seal.ResultID]
 	execData := s.execDataMap[block.ID()]
 
+	// notify backend block is available
+	s.backend.setHighestHeight(block.Header.Height)
+
 	var err error
 	s.Run("happy path TestGetExecutionDataByBlockID success", func() {
-		result.ExecutionDataID, err = s.eds.AddExecutionData(ctx, execData.BlockExecutionData)
+		result.ExecutionDataID, err = s.eds.Add(ctx, execData.BlockExecutionData)
 		require.NoError(s.T(), err)
 
 		res, err := s.backend.GetExecutionDataByBlockID(ctx, block.ID())
@@ -237,7 +264,7 @@ func (s *BackendExecutionDataSuite) TestGetExecutionDataByBlockID() {
 		assert.NoError(s.T(), err)
 	})
 
-	s.execDataCache.Clear()
+	s.execDataHeroCache.Clear()
 
 	s.Run("missing exec data for TestGetExecutionDataByBlockID failure", func() {
 		result.ExecutionDataID = unittest.IdentifierFixture()
@@ -246,58 +273,6 @@ func (s *BackendExecutionDataSuite) TestGetExecutionDataByBlockID() {
 		assert.Nil(s.T(), execDataRes)
 		assert.Equal(s.T(), codes.NotFound, status.Code(err))
 	})
-}
-
-func blockExecutionDataFixture(t *testing.T, block *flow.Block, events []flow.Event) *execution_data.BlockExecutionData {
-	numChunks := 5
-	minSerializedSize := 5 * execution_data.DefaultMaxBlobSize
-
-	chunks := make([]*execution_data.ChunkExecutionData, numChunks)
-
-	for i := 0; i < numChunks; i++ {
-		var e flow.EventsList
-		switch {
-		case i >= len(events):
-			e = flow.EventsList{}
-		case i == numChunks-1:
-			e = events[i:]
-		default:
-			e = flow.EventsList{events[i]}
-		}
-		chunks[i] = chunkExecutionDataFixture(t, uint64(minSerializedSize), e)
-	}
-
-	return &execution_data.BlockExecutionData{
-		BlockID:             block.ID(),
-		ChunkExecutionDatas: chunks,
-	}
-}
-
-func chunkExecutionDataFixture(t *testing.T, minSerializedSize uint64, events []flow.Event) *execution_data.ChunkExecutionData {
-	ced := &execution_data.ChunkExecutionData{
-		TrieUpdate: testutils.TrieUpdateFixture(1, 1, 8),
-		Events:     events,
-	}
-
-	size := 1
-
-	for {
-		buf := &bytes.Buffer{}
-		require.NoError(t, execution_data.DefaultSerializer.Serialize(buf, ced))
-		if buf.Len() >= int(minSerializedSize) {
-			return ced
-		}
-
-		v := make([]byte, size)
-		_, err := rand.Read(v)
-		require.NoError(t, err)
-
-		k, err := ced.TrieUpdate.Payloads[0].Key()
-		require.NoError(t, err)
-
-		ced.TrieUpdate.Payloads[0] = ledger.NewPayload(k, v)
-		size *= 2
-	}
 }
 
 func (s *BackendExecutionDataSuite) TestSubscribeExecutionData() {
@@ -328,12 +303,24 @@ func (s *BackendExecutionDataSuite) TestSubscribeExecutionData() {
 			startBlockID:    s.blocks[0].ID(),
 			startHeight:     0,
 		},
+		{
+			name:            "happy path - start from root block by height",
+			highestBackfill: len(s.blocks) - 1, // backfill all blocks
+			startBlockID:    flow.ZeroID,
+			startHeight:     s.backend.rootBlockHeight, // start from root block
+		},
+		{
+			name:            "happy path - start from root block by id",
+			highestBackfill: len(s.blocks) - 1,     // backfill all blocks
+			startBlockID:    s.backend.rootBlockID, // start from root block
+			startHeight:     0,
+		},
 	}
 
 	for _, test := range tests {
 		s.Run(test.name, func() {
 			// make sure we're starting with a fresh cache
-			s.execDataCache.Clear()
+			s.execDataHeroCache.Clear()
 
 			s.T().Logf("len(s.execDataMap) %d", len(s.execDataMap))
 
@@ -341,8 +328,7 @@ func (s *BackendExecutionDataSuite) TestSubscribeExecutionData() {
 			// this simulates a subscription on a past block
 			for i := 0; i <= test.highestBackfill; i++ {
 				s.T().Logf("backfilling block %d", i)
-				execData := s.execDataMap[s.blocks[i].ID()]
-				s.execDataDistributor.OnExecutionDataReceived(execData)
+				s.backend.setHighestHeight(s.blocks[i].Header.Height)
 			}
 
 			subCtx, subCancel := context.WithCancel(ctx)
@@ -356,7 +342,7 @@ func (s *BackendExecutionDataSuite) TestSubscribeExecutionData() {
 				// simulate new exec data received.
 				// exec data for all blocks with index <= highestBackfill were already received
 				if i > test.highestBackfill {
-					s.execDataDistributor.OnExecutionDataReceived(execData)
+					s.backend.setHighestHeight(b.Header.Height)
 					s.broadcaster.Publish()
 				}
 
@@ -404,6 +390,14 @@ func (s *BackendExecutionDataSuite) TestSubscribeExecutionDataHandlesErrors() {
 		assert.Equal(s.T(), codes.InvalidArgument, status.Code(sub.Err()))
 	})
 
+	s.Run("returns error for start height before root height", func() {
+		subCtx, subCancel := context.WithCancel(ctx)
+		defer subCancel()
+
+		sub := s.backend.SubscribeExecutionData(subCtx, flow.ZeroID, s.backend.rootBlockHeight-1)
+		assert.Equal(s.T(), codes.InvalidArgument, status.Code(sub.Err()))
+	})
+
 	s.Run("returns error for unindexed start blockID", func() {
 		subCtx, subCancel := context.WithCancel(ctx)
 		defer subCancel()
@@ -413,7 +407,7 @@ func (s *BackendExecutionDataSuite) TestSubscribeExecutionDataHandlesErrors() {
 	})
 
 	// make sure we're starting with a fresh cache
-	s.execDataCache.Clear()
+	s.execDataHeroCache.Clear()
 
 	s.Run("returns error for unindexed start height", func() {
 		subCtx, subCancel := context.WithCancel(ctx)

@@ -76,15 +76,14 @@ func TestGossipSubScoreTracer(t *testing.T) {
 		t,
 		sporkId,
 		t.Name(),
+		idProvider,
 		p2ptest.WithMetricsCollector(&mockPeerScoreMetrics{
 			NoopCollector: metrics.NoopCollector{},
 			c:             scoreMetrics,
 		}),
 		p2ptest.WithLogger(logger),
 		p2ptest.WithPeerScoreTracerInterval(1*time.Second), // set the peer score log interval to 1 second for sake of testing.
-		p2ptest.WithPeerScoringEnabled(idProvider),         // enable peer scoring for sake of testing.
-		// 4. Sets some fixed scores for the nodes for the sake of testing based on their roles.
-		p2ptest.WithPeerScoreParamsOption(&p2p.PeerScoringConfig{
+		p2ptest.EnablePeerScoringWithOverride(&p2p.PeerScoringConfigOverride{
 			AppSpecificScoreParams: func(pid peer.ID) float64 {
 				id, ok := idProvider.ByPeerID(pid)
 				require.True(t, ok)
@@ -130,6 +129,7 @@ func TestGossipSubScoreTracer(t *testing.T) {
 		t,
 		sporkId,
 		t.Name(),
+		idProvider,
 		p2ptest.WithRole(flow.RoleConsensus))
 	idProvider.On("ByPeerID", consensusNode.Host().ID()).Return(&consensusId, true).Maybe()
 
@@ -137,6 +137,7 @@ func TestGossipSubScoreTracer(t *testing.T) {
 		t,
 		sporkId,
 		t.Name(),
+		idProvider,
 		p2ptest.WithRole(flow.RoleAccess))
 	idProvider.On("ByPeerID", accessNode.Host().ID()).Return(&accessId, true).Maybe()
 
@@ -187,9 +188,7 @@ func TestGossipSubScoreTracer(t *testing.T) {
 	// IP score, and an existing mesh score.
 	assert.Eventually(t, func() bool {
 		// we expect the tracerNode to have the consensusNodes and accessNodes with the correct app scores.
-		exposer, ok := tracerNode.PeerScoreExposer()
-		require.True(t, ok)
-
+		exposer := tracerNode.PeerScoreExposer()
 		score, ok := exposer.GetAppScore(consensusNode.Host().ID())
 		if !ok || score != consensusScore {
 			return false

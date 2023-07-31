@@ -55,6 +55,8 @@ func (suite *Suite) TestHistoricalTransactionResult() {
 		nil,
 		suite.log,
 		DefaultSnapshotHistoryLimit,
+		nil,
+		false,
 	)
 
 	// Successfully return the transaction from the historical node
@@ -64,7 +66,7 @@ func (suite *Suite) TestHistoricalTransactionResult() {
 		Once()
 
 	// Make the call for the transaction result
-	result, err := backend.GetTransactionResult(ctx, txID)
+	result, err := backend.GetTransactionResult(ctx, txID, flow.ZeroID, flow.ZeroID)
 	suite.checkResponse(result, err)
 
 	// status should be sealed
@@ -112,6 +114,8 @@ func (suite *Suite) TestHistoricalTransaction() {
 		nil,
 		suite.log,
 		DefaultSnapshotHistoryLimit,
+		nil,
+		false,
 	)
 
 	// Successfully return the transaction from the historical node

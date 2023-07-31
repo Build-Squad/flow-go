@@ -3,7 +3,7 @@
 
 ####################################
 ## (1) Setup the build environment
-FROM golang:1.19-bullseye AS build-setup
+FROM golang:1.20-bullseye AS build-setup
 
 RUN apt-get update
 RUN apt-get -y install cmake zip
@@ -19,10 +19,13 @@ ARG TARGET
 ARG COMMIT
 ARG VERSION
 
+ENV GOPRIVATE=
+
 COPY . .
 
 RUN --mount=type=cache,sharing=locked,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=secret,id=git_creds,dst=/root/.netrc \
     make crypto_setup_gopath
 
 ####################################
@@ -39,6 +42,7 @@ ARG TAGS="relic,netgo"
 # https://github.com/golang/go/issues/27719#issuecomment-514747274
 RUN --mount=type=cache,sharing=locked,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=secret,id=git_creds,dst=/root/.netrc \
     CGO_ENABLED=1 GOOS=linux go build --tags "${TAGS}" -ldflags "-extldflags -static \
     -X 'github.com/onflow/flow-go/cmd/build.commit=${COMMIT}' -X  'github.com/onflow/flow-go/cmd/build.semver=${VERSION}'" \
     -o ./app ${TARGET}
@@ -67,7 +71,7 @@ RUN --mount=type=ssh \
 RUN chmod a+x /app/app
 
 ## (4) Add the statically linked debug binary to a distroless image configured for debugging
-FROM golang:1.19-bullseye as debug
+FROM golang:1.20-bullseye as debug
 
 RUN go install github.com/go-delve/delve/cmd/dlv@latest
 

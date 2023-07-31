@@ -11,11 +11,11 @@ import (
 
 	"github.com/onflow/flow-go/engine/execution/computation/computer"
 	executionState "github.com/onflow/flow-go/engine/execution/state"
-	"github.com/onflow/flow-go/engine/execution/state/delta"
 	"github.com/onflow/flow-go/fvm"
-	fvmState "github.com/onflow/flow-go/fvm/state"
-	"github.com/onflow/flow-go/fvm/storage"
 	"github.com/onflow/flow-go/fvm/storage/derived"
+	"github.com/onflow/flow-go/fvm/storage/logical"
+	"github.com/onflow/flow-go/fvm/storage/snapshot"
+	fvmState "github.com/onflow/flow-go/fvm/storage/state"
 	"github.com/onflow/flow-go/ledger"
 	"github.com/onflow/flow-go/ledger/partial"
 	chmodels "github.com/onflow/flow-go/model/chunks"
@@ -57,7 +57,15 @@ func (fcv *ChunkVerifier) Verify(
 	if vc.IsSystemChunk {
 		ctx = fvm.NewContextFromParent(
 			fcv.systemChunkCtx,
-			fvm.WithBlockHeader(vc.Header))
+			fvm.WithBlockHeader(vc.Header),
+			// `protocol.Snapshot` implements `EntropyProvider` interface
+			// Note that `Snapshot` possible errors for RandomSource() are:
+			// - storage.ErrNotFound if the QC is unknown.
+			// - state.ErrUnknownSnapshotReference if the snapshot reference block is unknown
+			// However, at this stage, snapshot reference block should be known and the QC should also be known,
+			// so no error is expected in normal operations, as required by `EntropyProvider`.
+			fvm.WithEntropyProvider(vc.Snapshot),
+		)
 
 		txBody, err := blueprints.SystemChunkTransaction(fcv.vmCtx.Chain)
 		if err != nil {
@@ -70,7 +78,15 @@ func (fcv *ChunkVerifier) Verify(
 	} else {
 		ctx = fvm.NewContextFromParent(
 			fcv.vmCtx,
-			fvm.WithBlockHeader(vc.Header))
+			fvm.WithBlockHeader(vc.Header),
+			// `protocol.Snapshot` implements `EntropyProvider` interface
+			// Note that `Snapshot` possible errors for RandomSource() are:
+			// - storage.ErrNotFound if the QC is unknown.
+			// - state.ErrUnknownSnapshotReference if the snapshot reference block is unknown
+			// However, at this stage, snapshot reference block should be known and the QC should also be known,
+			// so no error is expected in normal operations, as required by `EntropyProvider`.
+			fvm.WithEntropyProvider(vc.Snapshot),
+		)
 
 		transactions = make(
 			[]*fvm.TransactionProcedure,
@@ -94,7 +110,7 @@ func (fcv *ChunkVerifier) Verify(
 }
 
 type partialLedgerStorageSnapshot struct {
-	snapshot fvmState.StorageSnapshot
+	snapshot snapshot.StorageSnapshot
 
 	unknownRegTouch map[flow.RegisterID]struct{}
 }
@@ -166,21 +182,20 @@ func (fcv *ChunkVerifier) verifyTransactionsInContext(
 	context = fvm.NewContextFromParent(
 		context,
 		fvm.WithDerivedBlockData(
-			derived.NewEmptyDerivedBlockDataWithTransactionOffset(
-				transactionOffset)))
+			derived.NewEmptyDerivedBlockData(logical.Time(transactionOffset))))
 
 	// chunk view construction
 	// unknown register tracks access to parts of the partial trie which
 	// are not expanded and values are unknown.
 	unknownRegTouch := make(map[flow.RegisterID]struct{})
-	snapshotTree := storage.NewSnapshotTree(
+	snapshotTree := snapshot.NewSnapshotTree(
 		&partialLedgerStorageSnapshot{
 			snapshot: executionState.NewLedgerStorageSnapshot(
 				psmt,
 				chunkDataPack.StartState),
 			unknownRegTouch: unknownRegTouch,
 		})
-	chunkView := delta.NewDeltaView(nil)
+	chunkState := fvmState.NewExecutionState(nil, fvmState.DefaultParameters())
 
 	var problematicTx flow.Identifier
 	// executes all transactions in this chunk
@@ -203,7 +218,7 @@ func (fcv *ChunkVerifier) verifyTransactionsInContext(
 		serviceEvents = append(serviceEvents, output.ConvertedServiceEvents...)
 
 		snapshotTree = snapshotTree.Append(executionSnapshot)
-		err = chunkView.Merge(executionSnapshot)
+		err = chunkState.Merge(executionSnapshot)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to merge: %d (%w)", i, err)
 		}
@@ -223,9 +238,11 @@ func (fcv *ChunkVerifier) verifyTransactionsInContext(
 		return nil, nil, fmt.Errorf("cannot calculate events collection hash: %w", err)
 	}
 	if chunk.EventCollection != eventsHash {
-
+		collectionID := ""
+		if chunkDataPack.Collection != nil {
+			collectionID = chunkDataPack.Collection.ID().String()
+		}
 		for i, event := range events {
-
 			fcv.logger.Warn().Int("list_index", i).
 				Str("event_id", event.ID().String()).
 				Hex("event_fingerptint", event.Fingerprint()).
@@ -235,7 +252,7 @@ func (fcv *ChunkVerifier) verifyTransactionsInContext(
 				Uint32("event_index", event.EventIndex).
 				Bytes("event_payload", event.Payload).
 				Str("block_id", chunk.BlockID.String()).
-				Str("collection_id", chunkDataPack.Collection.ID().String()).
+				Str("collection_id", collectionID).
 				Str("result_id", result.ID().String()).
 				Uint64("chunk_index", chunk.Index).
 				Msg("not matching events debug")
@@ -257,7 +274,7 @@ func (fcv *ChunkVerifier) verifyTransactionsInContext(
 	// Applying chunk updates to the partial trie.	This returns the expected
 	// end state commitment after updates and the list of register keys that
 	// was not provided by the chunk data package (err).
-	chunkExecutionSnapshot := chunkView.Finalize()
+	chunkExecutionSnapshot := chunkState.Finalize()
 	keys, values := executionState.RegisterEntriesToKeysValues(
 		chunkExecutionSnapshot.UpdatedRegisters())
 

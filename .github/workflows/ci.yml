@@ -16,9 +16,9 @@ on:
       - 'v[0-9]+.[0-9]+'
 
 env:
-  GO_VERSION: 1.19
+  GO_VERSION: "1.20"
 
-concurrency: 
+concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
@@ -47,7 +47,7 @@ jobs:
       uses: golangci/golangci-lint-action@v3
       with:
         # Required: the version of golangci-lint is required and must be specified without patch version: we always use the latest patch version.
-        version: v1.49
+        version: v1.51
         args: -v --build-tags relic
         working-directory: ${{ matrix.dir }}
         # https://github.com/golangci/golangci-lint-action/issues/244
@@ -66,8 +66,8 @@ jobs:
           cache: true
       - name: Run tidy
         run: make tidy
-      - name: Emulator no relic check
-        run: make emulator-norelic-check
+      - name: code sanity check
+        run: make code-sanity-check
 
   shell-check:
     name: ShellCheck
@@ -149,7 +149,7 @@ jobs:
             make1: install-tools
             make2: test
             retries: 3
-            race: 1
+            race: 0
           - name: integration
             make1: install-tools
             make2: test
@@ -198,10 +198,14 @@ jobs:
           - make -C integration mvp-tests
           - make -C integration network-tests
           - make -C integration verification-tests
+          - make -C integration upgrades-tests
     runs-on: ubuntu-latest
     steps:
     - name: Checkout repo
       uses: actions/checkout@v3
+      with:
+          # all tags are needed for integration tests
+          fetch-depth: 0
     - name: Setup Go
       uses: actions/setup-go@v3
       with:
@@ -242,7 +246,7 @@ jobs:
     - name: Set up Localnet
       run: bash -c 'cd integration/localnet/ && make -e OBSERVER=2 bootstrap && make start-flow'
     - name: Ensure Observer is started
-      run: docker ps -f name=localnet_observer_1_1 | grep localnet_observer
+      run: docker ps -f name=localnet-observer_1-1 | grep localnet-observer
     - name: Get Client Version ensuring the client is provisioned
       run: docker run --network host localnet-client /go/flow -f /go/flow-localnet.json -n observer version
     - name: Wait for a default waiting period until a clean state

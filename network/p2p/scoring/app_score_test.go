@@ -33,14 +33,17 @@ func TestFullGossipSubConnectivity(t *testing.T) {
 
 	// two groups of non-access nodes and one group of access nodes.
 	groupOneNodes, groupOneIds := p2ptest.NodesFixture(t, sporkId, t.Name(), 5,
+		idProvider,
 		p2ptest.WithRole(flow.RoleConsensus),
-		p2ptest.WithPeerScoringEnabled(idProvider))
+		p2ptest.EnablePeerScoringWithOverride(p2p.PeerScoringConfigNoOverride))
 	groupTwoNodes, groupTwoIds := p2ptest.NodesFixture(t, sporkId, t.Name(), 5,
+		idProvider,
 		p2ptest.WithRole(flow.RoleCollection),
-		p2ptest.WithPeerScoringEnabled(idProvider))
+		p2ptest.EnablePeerScoringWithOverride(p2p.PeerScoringConfigNoOverride))
 	accessNodeGroup, accessNodeIds := p2ptest.NodesFixture(t, sporkId, t.Name(), 5,
+		idProvider,
 		p2ptest.WithRole(flow.RoleAccess),
-		p2ptest.WithPeerScoringEnabled(idProvider))
+		p2ptest.EnablePeerScoringWithOverride(p2p.PeerScoringConfigNoOverride))
 
 	ids := append(append(groupOneIds, groupTwoIds...), accessNodeIds...)
 	nodes := append(append(groupOneNodes, groupTwoNodes...), accessNodeGroup...)
@@ -147,22 +150,23 @@ func testGossipSubMessageDeliveryUnderNetworkPartition(t *testing.T, honestPeerS
 	// two (honest) consensus nodes
 	opts := []p2ptest.NodeFixtureParameterOption{p2ptest.WithRole(flow.RoleConsensus)}
 	if honestPeerScoring {
-		opts = append(opts, p2ptest.WithPeerScoringEnabled(idProvider))
+		opts = append(opts, p2ptest.EnablePeerScoringWithOverride(p2p.PeerScoringConfigNoOverride))
 	}
-	con1Node, con1Id := p2ptest.NodeFixture(t, sporkId, t.Name(), opts...)
-	con2Node, con2Id := p2ptest.NodeFixture(t, sporkId, t.Name(), opts...)
+	con1Node, con1Id := p2ptest.NodeFixture(t, sporkId, t.Name(), idProvider, opts...)
+	con2Node, con2Id := p2ptest.NodeFixture(t, sporkId, t.Name(), idProvider, opts...)
 
 	// create > 2 * 12 malicious access nodes
 	// 12 is the maximum size of default GossipSub mesh.
 	// We want to make sure that it is unlikely for honest nodes to be in the same mesh (hence messages from
 	// one honest node to the other is routed through the malicious nodes).
 	accessNodeGroup, accessNodeIds := p2ptest.NodesFixture(t, sporkId, t.Name(), 30,
+		idProvider,
 		p2ptest.WithRole(flow.RoleAccess),
-		p2ptest.WithPeerScoringEnabled(idProvider),
 		// overrides the default peer scoring parameters to mute GossipSub traffic from/to honest nodes.
-		p2ptest.WithPeerScoreParamsOption(&p2p.PeerScoringConfig{
+		p2ptest.EnablePeerScoringWithOverride(&p2p.PeerScoringConfigOverride{
 			AppSpecificScoreParams: maliciousAppSpecificScore(flow.IdentityList{&con1Id, &con2Id}),
-		}))
+		}),
+	)
 
 	allNodes := append([]p2p.LibP2PNode{con1Node, con2Node}, accessNodeGroup...)
 	allIds := append([]*flow.Identity{&con1Id, &con2Id}, accessNodeIds...)
@@ -217,7 +221,7 @@ func testGossipSubMessageDeliveryUnderNetworkPartition(t *testing.T, honestPeerS
 	return p2pfixtures.HasSubReceivedMessage(t, ctx1s, proposalMsg, con2Sub)
 }
 
-// maliciousAppSpecificScore returns a malicious app specific score function that rewards the malicious node and
+// maliciousAppSpecificScore returns a malicious app specific penalty function that rewards the malicious node and
 // punishes the honest nodes.
 func maliciousAppSpecificScore(honestIds flow.IdentityList) func(peer.ID) float64 {
 	honestIdProvider := id.NewFixedIdentityProvider(honestIds)

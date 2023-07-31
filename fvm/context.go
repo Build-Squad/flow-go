@@ -8,8 +8,8 @@ import (
 
 	"github.com/onflow/flow-go/fvm/environment"
 	reusableRuntime "github.com/onflow/flow-go/fvm/runtime"
-	"github.com/onflow/flow-go/fvm/state"
 	"github.com/onflow/flow-go/fvm/storage/derived"
+	"github.com/onflow/flow-go/fvm/storage/state"
 	"github.com/onflow/flow-go/fvm/tracing"
 	"github.com/onflow/flow-go/model/flow"
 	"github.com/onflow/flow-go/module"
@@ -160,10 +160,19 @@ func WithEventCollectionSizeLimit(limit uint64) Option {
 	}
 }
 
+// WithEntropyProvider sets the entropy provider of a virtual machine context.
+//
+// The VM uses the input to provide entropy to the Cadence runtime randomness functions.
+func WithEntropyProvider(source environment.EntropyProvider) Option {
+	return func(ctx Context) Context {
+		ctx.EntropyProvider = source
+		return ctx
+	}
+}
+
 // WithBlockHeader sets the block header for a virtual machine context.
 //
-// The VM uses the header to provide current block information to the Cadence runtime,
-// as well as to seed the pseudorandom number generator.
+// The VM uses the header to provide current block information to the Cadence runtime.
 func WithBlockHeader(header *flow.Header) Option {
 	return func(ctx Context) Context {
 		ctx.BlockHeader = header
